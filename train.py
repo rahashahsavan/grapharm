@@ -164,18 +164,36 @@ def train_model(args):
         # Training
         trainer.model.train()
         train_losses = []
+        val_ordering_losses = []
         
-        for batch_idx, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}")):
-            # Convert batch to list of individual graphs
-            graphs = [batch[i] for i in range(batch.num_graphs)]
+        # Create iterator for validation batches (for ordering network training)
+        val_iter = iter(val_loader)
+        
+        for batch_idx, train_batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}")):
+            # Convert train batch to list of individual graphs
+            train_graphs = [train_batch[i] for i in range(train_batch.num_graphs)]
             
-            # Training step
-            train_loss, val_loss = trainer.train_step(graphs)
+            # Get validation batch for ordering network
+            try:
+                val_batch = next(val_iter)
+            except StopIteration:
+                # Restart validation iterator if exhausted
+                val_iter = iter(val_loader)
+                val_batch = next(val_iter)
+            
+            val_graphs = [val_batch[i] for i in range(val_batch.num_graphs)]
+            
+            # Training step: denoising on train_graphs, ordering on val_graphs
+            train_loss, val_ordering_loss = trainer.train_step(train_graphs, val_graphs)
             train_losses.append(train_loss)
+            if val_ordering_loss is not None:
+                val_ordering_losses.append(val_ordering_loss)
             
             # Log progress
             if batch_idx % 10 == 0:
-                logger.info(f"Epoch {epoch+1}, Batch {batch_idx}, Train Loss: {train_loss:.4f}")
+                logger.info(f"Epoch {epoch+1}, Batch {batch_idx}, "
+                          f"Denoising Loss: {train_loss:.4f}, "
+                          f"Ordering Loss: {val_ordering_loss:.4f if val_ordering_loss else 0:.4f}")
         
         # Validation
         trainer.model.eval()
@@ -189,8 +207,10 @@ def train_model(args):
         
         avg_train_loss = np.mean(train_losses)
         avg_val_loss = np.mean(val_losses)
+        avg_val_ordering_loss = np.mean(val_ordering_losses) if val_ordering_losses else 0.0
         
-        logger.info(f"Epoch {epoch+1} - Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+        logger.info(f"Epoch {epoch+1} - Denoising Loss: {avg_train_loss:.4f}, "
+                   f"Ordering Loss: {avg_val_ordering_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
         
         # Save best model
         if avg_val_loss < best_val_loss:
