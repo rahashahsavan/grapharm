@@ -1,0 +1,39 @@
+# Core PyTorch packages
+torch>=1.12.0
+torchvision>=0.13.0
+torchaudio>=0.12.0
+
+# PyTorch Geometric ecosystem
+torch-geometric>=2.0.0
+torch-scatter>=2.0.0
+torch-sparse>=0.6.0
+torch-cluster>=1.6.0
+torch-spline-conv>=1.2.0
+
+# Scientific computing
+numpy>=1.21.0
+scipy>=1.8.0
+
+# Data handling
+pandas>=1.4.0
+scikit-learn>=1.1.0
+
+# Visualization
+matplotlib>=3.5.0
+seaborn>=0.11.0
+
+# Progress bars and logging
+tqdm>=4.64.0
+wandb>=0.12.0
+
+# Testing
+pytest>=7.0.0
+pytest-cov>=3.0.0
+
+# Chemistry (for SMILES handling)
+rdkit-pypi>=2022.3.0
+
+# Additional utilities
+networkx>=2.8.0
+joblib>=1.1.0
+psutil>=5.9.0
