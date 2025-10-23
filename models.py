@@ -194,10 +194,10 @@ class DenoisingNetwork(nn.Module):
             node_probs: p(v_{\tilde{τ}_t} | G_{t+1})
             edge_probs: p(e_{v_t, v_j} | G_{t+1}) for all previous nodes v_j
         """
-        # Get graph data
-        x = graph.x.long().squeeze(-1)  # [N]
-        edge_index = graph.edge_index   # [2, E]
-        edge_attr = graph.edge_attr.long().squeeze(-1)  # [E]
+        # Get graph data - ENSURE all tensors are on correct device
+        x = graph.x.long().squeeze(-1).to(self.device)  # [N]
+        edge_index = graph.edge_index.to(self.device)   # [2, E]
+        edge_attr = graph.edge_attr.long().squeeze(-1).to(self.device)  # [E]
         
         # Step 1: Embedding Encoding
         h = self.node_embedding(x)         # [N, hidden_dim]
@@ -215,6 +215,9 @@ class DenoisingNetwork(nn.Module):
         # Step 3: Node Type Prediction
         # p(v_{\tilde{τ}_t} | G_{t+1}) = Softmax(MLP_n([h_L^G || h_{v_{\tilde{τ}_t}}]))
         if target_node_idx is not None:
+            # CRITICAL FIX: Validate target_node_idx is within bounds
+            if target_node_idx >= h.shape[0]:
+                raise IndexError(f"target_node_idx {target_node_idx} is out of bounds for tensor with {h.shape[0]} nodes")
             # Predict for specific target node
             target_emb = h[target_node_idx]  # [hidden_dim]
             node_input = torch.cat([h_L_G, target_emb], dim=-1)  # [2*hidden_dim]
@@ -230,13 +233,26 @@ class DenoisingNetwork(nn.Module):
         # Step 4: Edge Type Prediction (Mixture of Multinomials)
         edge_probs = None
         if previous_nodes is not None and len(previous_nodes) > 0 and target_node_idx is not None:
+            # CRITICAL FIX: Validate all indices are within bounds
+            if target_node_idx >= h.shape[0]:
+                raise IndexError(f"target_node_idx {target_node_idx} is out of bounds for tensor with {h.shape[0]} nodes")
+            
+            # Filter previous_nodes to only include valid indices (safety check)
+            previous_nodes = [n for n in previous_nodes if n < h.shape[0]]
+            if len(previous_nodes) == 0:
+                return node_probs, None
+            
             M = len(previous_nodes)  # Number of previous nodes
             
             # Current node embedding
             h_v_t = h[target_node_idx]  # [hidden_dim]
             
-            # Previous nodes embeddings
-            h_v_j = h[previous_nodes]  # [M, hidden_dim]
+            # Previous nodes embeddings - CRITICAL: Convert to tensor if list
+            if isinstance(previous_nodes, list):
+                previous_nodes_tensor = torch.tensor(previous_nodes, dtype=torch.long, device=self.device)
+            else:
+                previous_nodes_tensor = previous_nodes
+            h_v_j = h[previous_nodes_tensor]  # [M, hidden_dim]
             
             # Expand for all previous nodes
             h_L_G_expanded = h_L_G.unsqueeze(0).expand(M, -1)  # [M, hidden_dim]
@@ -325,8 +341,9 @@ class DiffusionOrderingNetwork(nn.Module):
         )
         
         # Positional encoding for absorbed nodes
+        # CORRECTED: Use register_buffer to ensure pos_encoding moves with model
         self.max_nodes = 100
-        self.pos_encoding = self._create_positional_encoding(self.max_nodes, hidden_dim)
+        self.register_buffer('pos_encoding', self._create_positional_encoding(self.max_nodes, hidden_dim))
         
         self.reset_parameters()
     
@@ -364,10 +381,10 @@ class DiffusionOrderingNetwork(nn.Module):
         if node_order is None:
             node_order = []
         
-        # Get graph data
-        x = graph.x.long().squeeze(-1)  # [N]
-        edge_index = graph.edge_index   # [2, E]
-        edge_type = graph.edge_attr.long().squeeze(-1)  # [E]
+        # Get graph data - ENSURE all tensors are on correct device
+        x = graph.x.long().squeeze(-1).to(self.device)  # [N]
+        edge_index = graph.edge_index.to(self.device)   # [2, E]
+        edge_type = graph.edge_attr.long().squeeze(-1).to(self.device)  # [E]
         
         # Embed nodes
         h = self.node_embedding(x)  # [N, hidden_dim]
@@ -375,7 +392,7 @@ class DiffusionOrderingNetwork(nn.Module):
         # Add positional encoding for absorbed nodes
         for i, node_idx in enumerate(node_order):
             if i < self.max_nodes and node_idx < h.size(0):
-                h[node_idx] += self.pos_encoding[i].to(self.device)
+                h[node_idx] += self.pos_encoding[i]  # No need for .to(device) - buffer handles it
         
         # 3-layer RGCN message passing
         for layer in self.rgcn_layers:

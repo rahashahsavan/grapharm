@@ -61,8 +61,14 @@ def test_node_masking(dataset, sample):
         masked_sample = masker.mask_node(connected_sample, 0)
         logger.info(f"✅ Node masking successful: {masked_sample.x[0].item()} == {masker.NODE_MASK}")
         
-        # Test demasking
-        demasked_sample = masker.demask_node(masked_sample, 0, 1, torch.tensor([0, 1, 2]))
+        # Test demasking - CORRECTED: connections_types should match number of unmasked nodes
+        # After masking node 0, we have (n_nodes - 1) unmasked nodes
+        unmasked_nodes = [i for i in range(masked_sample.x.shape[0]) 
+                         if not masker.is_masked(masked_sample, i)]
+        n_unmasked = len(unmasked_nodes)
+        # Generate random edge types for connections to unmasked nodes
+        edge_types = torch.randint(0, 3, (n_unmasked,))
+        demasked_sample = masker.demask_node(masked_sample, 0, 1, edge_types)
         logger.info(f"✅ Node demasking successful: {demasked_sample.x[0].item()}")
         
         return masker
@@ -91,7 +97,7 @@ def test_model_initialization(dataset):
             K=5,            # Smaller for testing
             device=device
         )
-        
+        model = model.to(device)
         logger.info(f"✅ Model initialized successfully")
         logger.info(f"✅ Parameters: {sum(p.numel() for p in model.parameters())}")
         
@@ -101,18 +107,26 @@ def test_model_initialization(dataset):
         return None, None
 
 
-def test_forward_pass(model, sample, device):
+def test_forward_pass(model, sample, device, masker):
     """Test forward pass through the model."""
     logger.info("🧪 Testing forward pass...")
     
     try:
         model.eval()
         
-        # Prepare sample
-        sample = sample.to(device)
-        sample.x = sample.x.long()
-        sample.edge_attr = sample.edge_attr.long()
+        # CRITICAL: Convert sample to indexed format first using masker.idxify()
+        # This maps node/edge types to 0-indexed values that match embedding sizes
+        sample = masker.idxify(sample.clone())
         
+        # Prepare sample - move to device and ensure long type
+        sample = sample.clone()
+        sample.x = sample.x.long().to(device)
+        sample.edge_index = sample.edge_index.to(device)
+        sample.edge_attr = sample.edge_attr.long().to(device)
+        sample = sample.to(device)
+        assert torch.max(sample.edge_index) < sample.x.size(0), \
+            f"⚠️ Invalid edge index! max={torch.max(sample.edge_index)}, num_nodes={sample.x.size(0)}"
+
         with torch.no_grad():
             # Test diffusion ordering network
             ordering_probs = model.diffusion_ordering_network(sample)
@@ -179,19 +193,15 @@ def test_diffusion_trajectory(trainer, sample):
         return False
 
 
-def test_molecule_generation(model, masker, device):
+def test_molecule_generation(trainer):
     """Test molecule generation."""
     logger.info("🧪 Testing molecule generation...")
     
     try:
-        model.eval()
-        
-        # Generate a small molecule
-        generated_graph = model.generate_molecule(
-            masker=masker,
+        # Generate a small molecule using trainer
+        generated_graph = trainer.generate_molecule(
             max_nodes=5,  # Small molecule for testing
-            sampling_method="sample",
-            device=device
+            sampling_method="sample"
         )
         
         logger.info(f"✅ Molecule generated: {generated_graph.x.shape[0]} nodes")
@@ -204,7 +214,7 @@ def test_molecule_generation(model, masker, device):
         return None
 
 
-def test_batch_generation(model, masker, device, num_molecules=5):
+def test_batch_generation(trainer, num_molecules=5):
     """Test batch molecule generation."""
     logger.info(f"🧪 Testing batch generation of {num_molecules} molecules...")
     
@@ -215,11 +225,9 @@ def test_batch_generation(model, masker, device, num_molecules=5):
         start_time = time.time()
         
         for i in range(num_molecules):
-            graph = model.generate_molecule(
-                masker=masker,
+            graph = trainer.generate_molecule(
                 max_nodes=8,  # Small molecules for testing
-                sampling_method="sample",
-                device=device
+                sampling_method="sample"
             )
             
             if graph is not None:
@@ -301,7 +309,7 @@ def run_comprehensive_test():
         return test_results
     
     # Test 4: Forward Pass
-    test_results['forward_pass'] = test_forward_pass(model, sample, device)
+    test_results['forward_pass'] = test_forward_pass(model, sample, device, masker)
     
     # Test 5: Training Step
     trainer = test_training_step(model, dataset, device)
@@ -312,11 +320,17 @@ def run_comprehensive_test():
         test_results['diffusion_trajectory'] = test_diffusion_trajectory(trainer, sample)
     
     # Test 7: Molecule Generation
-    test_results['molecule_generation'] = test_molecule_generation(model, masker, device) is not None
+    if trainer:
+        test_results['molecule_generation'] = test_molecule_generation(trainer) is not None
+    else:
+        test_results['molecule_generation'] = False
     
     # Test 8: Batch Generation
-    graphs, smiles = test_batch_generation(model, masker, device, num_molecules=3)
-    test_results['batch_generation'] = len(graphs) > 0
+    if trainer:
+        graphs, smiles = test_batch_generation(trainer, num_molecules=3)
+        test_results['batch_generation'] = len(graphs) > 0
+    else:
+        test_results['batch_generation'] = False
     
     # Test 9: Model Saving/Loading
     test_results['model_save_load'] = test_model_saving_loading(model, device)

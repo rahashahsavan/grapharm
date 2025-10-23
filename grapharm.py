@@ -70,14 +70,13 @@ class GraphARMTrainer:
         """
         graph = graph.clone().to(self.device)
         graph = self.masker.idxify(graph)
-        graph = self.masker.fully_connect(graph)
+        # Do NOT fully connect - keep original edges
+        # Masked nodes will be connected with MASK edges in mask_node()
         
         n_nodes = graph.x.shape[0]
         
         # ASSERTION: Check valid input
         assert n_nodes > 0, "Graph must have at least one node"
-        assert graph.edge_index.shape[1] == n_nodes * n_nodes, \
-            f"Graph must be fully connected: expected {n_nodes * n_nodes} edges, got {graph.edge_index.shape[1]}"
         
         # Initialize trajectory with original graph
         trajectory = [graph.clone()]
@@ -195,67 +194,71 @@ class GraphARMTrainer:
             assert t + 1 < len(trajectory), \
                 f"Timestep {t} out of bounds: trajectory length {len(trajectory)}"
             
-            # G_{t+1} is the graph at timestep t+1 (has t+1 nodes masked: σ_0...σ_t)
-            # In reverse (denoising), we want to predict nodes that should be unmasked
-            current_graph = trajectory[t + 1]
+            # CORRECTED PER SPECIFICATION:
+            # At step t (1-indexed in paper, 0-indexed here):
+            # - Input: G_{t+1} = trajectory[t+1]
+            # - Target: σ_t = node_order[t]
+            # - Previous: σ(>t) = node_order[t+1:]
             
-            # For all k ∈ σ(≤t) (all nodes masked up to and including timestep t)
-            # These are nodes σ_0, σ_1, ..., σ_t (indices 0 to t in node_order)
-            for k_idx in range(t + 1):
-                if k_idx >= len(node_order):
-                    continue
-                
-                k = node_order[k_idx]  # The actual node index being unmasked
-                
-                # Get w^{i,m}_k from ordering probabilities
-                # w_k = q_φ(σ^{i,m}_t = k | G^i_0, σ^{i,m}_{<t})
-                if k_idx < len(ordering_probs):
-                    w_k = ordering_probs[k_idx][k].item() if k < ordering_probs[k_idx].shape[0] else 1e-8
-                else:
-                    w_k = 1e-8
-                
-                # Get predictions from denoising network
-                # Network predicts node type and edges for node being unmasked
-                # previous_nodes are nodes that are unmasked in current_graph (after timestep t)
-                previous_nodes_list = node_order[t + 1:] if t + 1 < len(node_order) else []
-                node_logits, edge_logits = self.model.denoising_network(
-                    current_graph, k, previous_nodes_list
-                )
-                
-                # Compute log probability for node type
-                if k < original_graph.x.shape[0]:
-                    target_node_type = original_graph.x[k].long().item()
-                    node_log_prob = F.log_softmax(node_logits, dim=-1)[target_node_type]
-                else:
-                    node_log_prob = torch.tensor(0.0, device=self.device)
-                
-                # Compute log probability for edges (to previously unmasked nodes)
-                edge_log_prob = torch.tensor(0.0, device=self.device)
-                if edge_logits is not None and k < original_graph.x.shape[0]:
-                    # Get edges from k to nodes that are unmasked (after timestep t)
-                    # These are nodes at positions (t+1)..n in node_order
-                    previous_nodes = node_order[t + 1:]
+            G_t_plus_1_raw = trajectory[t + 1]
+            target_node = node_order[t]  # σ_t (0-indexed)
+            previous_nodes = node_order[t + 1:]  # [σ_{t+1}, ..., σ_n]
+            
+            # Prepare input: Only target masked + previous nodes unmasked
+            G_input, target_idx, previous_indices = self.masker.prepare_denoising_input(
+                G_t_plus_1_raw,
+                target_node,
+                previous_nodes
+            )
+            
+            # Move to device
+            G_input = G_input.to(self.device)
+            G_input.x = G_input.x.long()
+            G_input.edge_attr = G_input.edge_attr.long()
+            
+            # Get importance weight w_k from ordering network
+            if t < len(ordering_probs):
+                w_k = ordering_probs[t][target_node].item() if target_node < ordering_probs[t].shape[0] else 1e-8
+            else:
+                w_k = 1e-8
+            
+            # Forward pass through denoising network
+            node_logits, edge_logits = self.model.denoising_network(
+                G_input,
+                target_idx,  # Always 0 in prepared graph
+                previous_indices  # [1, 2, ..., M] in prepared graph
+            )
+            
+            # Compute log probability for node type
+            if target_node < original_graph.x.shape[0]:
+                true_node_type = original_graph.x[target_node].long().item()
+                node_log_prob = F.log_softmax(node_logits, dim=-1)[true_node_type]
+            else:
+                node_log_prob = torch.tensor(0.0, device=self.device)
+            
+            # Compute log probability for edges to previous nodes
+            edge_log_prob = torch.tensor(0.0, device=self.device)
+            if edge_logits is not None and len(previous_nodes) > 0 and target_node < original_graph.x.shape[0]:
+                for prev_idx, prev_node in enumerate(previous_nodes):
+                    if prev_node >= original_graph.x.shape[0]:
+                        continue
                     
-                    for prev_idx, prev_node in enumerate(previous_nodes):
-                        if prev_node >= original_graph.x.shape[0] or k >= original_graph.x.shape[0]:
-                            continue
-                        
-                        # Find edge type between k and prev_node in original graph
-                        edge_mask = ((original_graph.edge_index[0] == k) & 
-                                    (original_graph.edge_index[1] == prev_node))
-                        
-                        if edge_mask.sum() > 0:
-                            target_edge_type = original_graph.edge_attr[edge_mask][0].long().item()
-                            if prev_idx < edge_logits.shape[0]:
-                                edge_log_prob += F.log_softmax(edge_logits[prev_idx], dim=-1)[target_edge_type]
-                
-                # Total log probability for this k
-                log_prob = node_log_prob + edge_log_prob
-                
-                # Weight by (n_i * w_k / T)
-                weighted_log_prob = (n_i * w_k / T) * log_prob
-                
-                total_loss += weighted_log_prob
+                    # Find edge type between target_node and prev_node in original graph
+                    edge_mask = ((original_graph.edge_index[0] == target_node) & 
+                                (original_graph.edge_index[1] == prev_node))
+                    
+                    if edge_mask.sum() > 0:
+                        true_edge_type = original_graph.edge_attr[edge_mask][0].long().item()
+                        if prev_idx < edge_logits.shape[0]:
+                            edge_log_prob += F.log_softmax(edge_logits[prev_idx], dim=-1)[true_edge_type]
+            
+            # Total log probability
+            log_prob = node_log_prob + edge_log_prob
+            
+            # Weight by (n_i * w_k / T)
+            weighted_log_prob = (n_i * w_k / T) * log_prob
+            
+            total_loss += weighted_log_prob
         
         # Return negative loss (we want to maximize log likelihood = minimize negative log likelihood)
         return -total_loss
@@ -304,68 +307,85 @@ class GraphARMTrainer:
             # Use G_{t+1} as input
             if t + 1 >= len(trajectory):
                 continue
-            current_graph = trajectory[t + 1]
             
-            # For all k ∈ σ(≤t)
-            for k_idx in range(t + 1):
-                if k_idx >= len(node_order):
-                    continue
+            # CORRECTED PER SPECIFICATION (same as denoising loss)
+            G_t_plus_1_raw = trajectory[t + 1]
+            target_node = node_order[t]  # σ_t
+            previous_nodes = node_order[t + 1:]  # [σ_{t+1}, ..., σ_n]
+            
+            # Prepare input
+            G_input, target_idx, previous_indices = self.masker.prepare_denoising_input(
+                G_t_plus_1_raw,
+                target_node,
+                previous_nodes
+            )
+            
+            # Move to device
+            G_input = G_input.to(self.device)
+            G_input.x = G_input.x.long()
+            G_input.edge_attr = G_input.edge_attr.long()
+            
+            # Get w^{i,m}_k
+            if t < len(ordering_probs):
+                w_k = ordering_probs[t][target_node].item() if target_node < ordering_probs[t].shape[0] else 1e-8
+            else:
+                w_k = 1e-8
+            
+            # Get predictions from denoising network (detached for reward)
+            with torch.no_grad():
+                node_logits, edge_logits = self.model.denoising_network(
+                    G_input,
+                    target_idx,  # Always 0 in prepared graph
+                    previous_indices  # [1, 2, ..., M] in prepared graph
+                )
                 
-                k = node_order[k_idx]
-                
-                # Get w^{i,m}_k
-                if k_idx < len(ordering_probs):
-                    w_k = ordering_probs[k_idx][k].item() if k < ordering_probs[k_idx].shape[0] else 1e-8
+                # Compute log probability
+                if target_node < original_graph.x.shape[0]:
+                    true_node_type = original_graph.x[target_node].long().item()
+                    node_log_prob = F.log_softmax(node_logits, dim=-1)[true_node_type]
                 else:
-                    w_k = 1e-8
+                    node_log_prob = torch.tensor(0.0, device=self.device)
                 
-                # Get predictions from denoising network (detached for reward)
-                with torch.no_grad():
-                    previous_nodes_list = node_order[t + 1:] if t + 1 < len(node_order) else []
-                    node_logits, edge_logits = self.model.denoising_network(
-                        current_graph, k, previous_nodes_list
-                    )
-                    
-                    # Compute log probability
-                    if k < original_graph.x.shape[0]:
-                        target_node_type = original_graph.x[k].long().item()
-                        node_log_prob = F.log_softmax(node_logits, dim=-1)[target_node_type]
-                    else:
-                        node_log_prob = torch.tensor(0.0, device=self.device)
-                    
-                    # Edge log probability
-                    edge_log_prob = torch.tensor(0.0, device=self.device)
-                    if edge_logits is not None and k < original_graph.x.shape[0]:
-                        previous_nodes = node_order[t + 1:]
+                # Edge log probability
+                edge_log_prob = torch.tensor(0.0, device=self.device)
+                if edge_logits is not None and len(previous_nodes) > 0 and target_node < original_graph.x.shape[0]:
+                    for prev_idx, prev_node in enumerate(previous_nodes):
+                        if prev_node >= original_graph.x.shape[0]:
+                            continue
                         
-                        for prev_idx, prev_node in enumerate(previous_nodes):
-                            if prev_node >= original_graph.x.shape[0] or k >= original_graph.x.shape[0]:
-                                continue
-                            
-                            edge_mask = ((original_graph.edge_index[0] == k) & 
-                                        (original_graph.edge_index[1] == prev_node))
-                            
-                            if edge_mask.sum() > 0:
-                                target_edge_type = original_graph.edge_attr[edge_mask][0].long().item()
-                                if prev_idx < edge_logits.shape[0]:
-                                    edge_log_prob += F.log_softmax(edge_logits[prev_idx], dim=-1)[target_edge_type]
-                    
-                    log_prob = node_log_prob + edge_log_prob
+                        edge_mask = ((original_graph.edge_index[0] == target_node) & 
+                                    (original_graph.edge_index[1] == prev_node))
+                        
+                        if edge_mask.sum() > 0:
+                            true_edge_type = original_graph.edge_attr[edge_mask][0].long().item()
+                            if prev_idx < edge_logits.shape[0]:
+                                edge_log_prob += F.log_softmax(edge_logits[prev_idx], dim=-1)[true_edge_type]
                 
-                # Accumulate reward
-                reward += (n_i / T) * w_k * log_prob.item()
+                log_prob = node_log_prob + edge_log_prob
+            
+            # Accumulate reward
+            reward += (n_i / T) * w_k * log_prob.item()
         
         # Reward is negative of the sum (we want high log prob = low negative log prob)
         reward = -reward
         
         # Compute log probability of the trajectory: log q_φ(σ^{i,m} | G^i_0)
-        log_q_trajectory = 0.0
+        # CRITICAL: Build from probs directly to preserve gradient flow
+        log_probs = []
         for t, (probs, node_idx) in enumerate(zip(ordering_probs, node_order)):
             if node_idx < probs.shape[0]:
-                log_q_trajectory += torch.log(probs[node_idx] + 1e-8)
+                log_probs.append(torch.log(probs[node_idx] + 1e-8))
+        
+        if len(log_probs) == 0:
+            # No valid log probs - return zero loss
+            return torch.tensor(0.0, device=self.device)
+        
+        # Stack and sum to preserve gradients
+        log_q_trajectory = torch.stack(log_probs).sum()
         
         # REINFORCE loss: -R^{i,m} * log q_φ(σ^{i,m} | G^i_0)
         # Negative because we minimize the loss (gradient ascent on reward)
+        # reward is a scalar (Python float), log_q_trajectory is a tensor with grad
         ordering_loss = -reward * log_q_trajectory
         
         return ordering_loss
@@ -388,7 +408,7 @@ class GraphARMTrainer:
         self.model.train()
         
         # ===== STEP 1: Train Denoising Network on Training Batch =====
-        total_denoising_loss = 0.0
+        total_denoising_loss = torch.tensor(0.0, device=self.device)
         num_train_trajectories = 0
         
         for graph in train_batch:
@@ -399,7 +419,7 @@ class GraphARMTrainer:
                 # Compute denoising loss
                 denoising_loss = self.compute_denoising_loss(trajectory, node_order, ordering_probs)
                 
-                total_denoising_loss += denoising_loss
+                total_denoising_loss = total_denoising_loss + denoising_loss
                 num_train_trajectories += 1
         
         # Normalize and update denoising network
@@ -416,7 +436,7 @@ class GraphARMTrainer:
             train_loss = 0.0
         
         # ===== STEP 2: Train Ordering Network on Validation Batch =====
-        total_ordering_loss = 0.0
+        total_ordering_loss = torch.tensor(0.0, device=self.device)
         num_val_trajectories = 0
         val_loss = None
         
@@ -429,7 +449,7 @@ class GraphARMTrainer:
                     # Compute ordering loss with REINFORCE
                     ordering_loss = self.compute_ordering_loss(trajectory, node_order, ordering_probs)
                     
-                    total_ordering_loss += ordering_loss
+                    total_ordering_loss = total_ordering_loss + ordering_loss
                     num_val_trajectories += 1
             
             # Normalize and update ordering network
@@ -530,6 +550,9 @@ class GraphARMTrainer:
         """
         Generate a single molecule using the trained model.
         
+        CORRECTED: In generation (reverse denoising), we incrementally add nodes.
+        NO masked nodes in generation - only real unmasked nodes.
+        
         Args:
             max_nodes: Maximum number of nodes to generate
             sampling_method: "sample" or "argmax"
@@ -541,12 +564,41 @@ class GraphARMTrainer:
         
         with torch.no_grad():
             # Start with a single masked node
-            current_graph = self.masker.generate_fully_masked(n_nodes=1)
-            current_graph = current_graph.to(self.device)
+            current_graph = self.masker.generate_fully_masked(n_nodes=1, device=self.device)
             
             for step in range(max_nodes - 1):
-                # Predict next node
-                node_probs, edge_probs = self.model.denoising_network(current_graph, 0)
+                # CRITICAL: Remove masked nodes before feeding to denoising network
+                # Keep only unmasked nodes for clean input
+                current_graph_clean, idx_mapping = self.masker.remove_masked_nodes_and_edges(current_graph)
+                
+                # Get currently unmasked nodes in cleaned graph
+                unmasked_nodes = list(range(current_graph_clean.x.shape[0]))
+                
+                # If this is the first node, pass empty graph to network
+                if current_graph_clean.x.shape[0] == 0:
+                    # First node: create a minimal graph with one MASK node for prediction
+                    temp_graph = self.masker.generate_fully_masked(n_nodes=1, device=self.device)
+                    temp_graph_clean, _ = self.masker.remove_masked_nodes_and_edges(temp_graph)
+                    # Since all nodes are masked, we get empty graph - handle separately
+                    # Use a dummy input for first node prediction
+                    current_graph_clean = Data(
+                        x=torch.tensor([[self.masker.NODE_MASK]], dtype=torch.long, device=self.device),
+                        edge_index=torch.empty((2, 0), dtype=torch.long, device=self.device),
+                        edge_attr=torch.empty((0,), dtype=torch.long, device=self.device)
+                    )
+                    target_node = 0
+                    unmasked_nodes = []
+                else:
+                    # For subsequent nodes, target is a new node being added
+                    # We'll add it after prediction
+                    target_node = 0  # Dummy target for now
+                
+                # Predict next node type and edges to previous unmasked nodes
+                node_probs, edge_probs = self.model.denoising_network(
+                    current_graph_clean, 
+                    target_node,
+                    unmasked_nodes  # Previous unmasked nodes
+                )
                 
                 # Sample node type
                 if sampling_method == "sample":
@@ -554,26 +606,46 @@ class GraphARMTrainer:
                 else:
                     node_type = torch.argmax(node_probs).item()
                 
-                # Sample edge types
-                if sampling_method == "sample":
-                    edge_types = torch.multinomial(edge_probs, current_graph.x.shape[0]).squeeze()
+                # Sample edge types - only for connections to unmasked nodes
+                if edge_probs is not None and len(unmasked_nodes) > 0:
+                    if sampling_method == "sample":
+                        # edge_probs shape: [M, num_edge_types] where M = len(unmasked_nodes)
+                        # Sample one edge type per unmasked node
+                        edge_types = torch.multinomial(edge_probs, 1).squeeze()  # [M]
+                    else:
+                        edge_types = torch.argmax(edge_probs, dim=-1)  # [M]
                 else:
-                    edge_types = torch.argmax(edge_probs, dim=-1)
+                    # First node - no previous nodes to connect to
+                    edge_types = torch.tensor([], dtype=torch.long, device=self.device)
                 
-                # Demask the current node
+                # Demask the current node with edges to unmasked nodes only
                 current_graph = self.masker.demask_node(current_graph, 0, node_type, edge_types)
                 
-                # Add new masked node
+                # Add new masked node for next iteration
                 current_graph = self.masker.add_masked_node(current_graph)
             
             # Demask the final node
-            node_probs, edge_probs = self.model.denoising_network(current_graph, 0)
+            unmasked_nodes = [i for i in range(current_graph.x.shape[0]) 
+                            if not self.masker.is_masked(current_graph, i)]
+            
+            node_probs, edge_probs = self.model.denoising_network(
+                current_graph, 
+                0, 
+                unmasked_nodes
+            )
+            
             if sampling_method == "sample":
                 node_type = torch.multinomial(node_probs, 1).item()
-                edge_types = torch.multinomial(edge_probs, current_graph.x.shape[0]).squeeze()
+                if edge_probs is not None and len(unmasked_nodes) > 0:
+                    edge_types = torch.multinomial(edge_probs, 1).squeeze()
+                else:
+                    edge_types = torch.tensor([], dtype=torch.long, device=self.device)
             else:
                 node_type = torch.argmax(node_probs).item()
-                edge_types = torch.argmax(edge_probs, dim=-1)
+                if edge_probs is not None and len(unmasked_nodes) > 0:
+                    edge_types = torch.argmax(edge_probs, dim=-1)
+                else:
+                    edge_types = torch.tensor([], dtype=torch.long, device=self.device)
             
             current_graph = self.masker.demask_node(current_graph, 0, node_type, edge_types)
             
